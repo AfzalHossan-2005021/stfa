@@ -14,6 +14,7 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
+from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import cosine_distances
 from anndata import AnnData
 from typing import Optional
@@ -136,15 +137,23 @@ def _boundary_weights(adj: sp.csr_matrix) -> np.ndarray:
     High u_i → interior cell (far from border) → reliable anchor.
     Low  u_i → peripheral cell → uncertain.
     """
-    n = adj.shape[0]
-    deg = np.asarray(adj.sum(axis=1)).ravel()
+    if adj is None:
+        raise ValueError("adj must be a valid sparse adjacency matrix")
+
+    adj_csr = sp.csr_matrix(adj)
+
+    shape = adj_csr.shape
+    if shape is None:
+        raise ValueError("adjacency matrix must define shape")
+    n = int(shape[0])
+    deg = np.asarray(adj_csr.sum(axis=1)).ravel()
     median_deg = np.median(deg)
     peripheral = np.where(deg < median_deg)[0]
 
     if len(peripheral) == 0:
         return np.ones(n, dtype=np.float64)
 
-    dist_mat = csgraph.shortest_path(adj, directed=False, indices=peripheral,
+    dist_mat = csgraph.shortest_path(adj_csr, directed=False, indices=peripheral,
                                      unweighted=True)   # (|peripheral|, N)
     d_to_border = dist_mat.min(axis=0)                  # (N,)
     d_to_border = np.where(np.isinf(d_to_border), d_to_border[~np.isinf(d_to_border)].max() + 1,
@@ -172,6 +181,99 @@ def compute_M_boundary(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# M_compact — coarse rigidly aligned cross-slice spatial compactness
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _fit_weighted_rigid_transform(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    coupling: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fit a weighted rigid transform (rotation + translation) from src_pts to
+    tgt_pts using coupling weights.
+
+    Returns
+    -------
+    R      : (2, 2) rotation matrix (det = +1)
+    t_src  : (2,) source weighted centroid
+    t_tgt  : (2,) target weighted centroid
+    """
+    mass = float(coupling.sum())
+    if mass <= 0:
+        return np.eye(2, dtype=np.float64), np.zeros(2), np.zeros(2)
+
+    w_src = coupling.sum(axis=1)
+    w_tgt = coupling.sum(axis=0)
+
+    t_src = (w_src[:, None] * src_pts).sum(axis=0) / (w_src.sum() + 1e-12)
+    t_tgt = (w_tgt[:, None] * tgt_pts).sum(axis=0) / (w_tgt.sum() + 1e-12)
+
+    src_c = src_pts - t_src
+    tgt_c = tgt_pts - t_tgt
+
+    # Weighted Procrustes cross-covariance.
+    H = tgt_c.T @ ((coupling / (mass + 1e-12)).T @ src_c)
+    U, _, Vt = np.linalg.svd(H, full_matrices=False)
+
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+
+    return R.astype(np.float64), t_src.astype(np.float64), t_tgt.astype(np.float64)
+
+
+def compute_M_compact(
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    comm_A: np.ndarray,
+    comm_B: np.ndarray,
+    pi_comm: np.ndarray,
+    quantile: float = 0.90,
+    distance_power: float = 1.25,
+) -> np.ndarray:
+    """
+    Compactness-promoting cross-slice spatial cost.
+
+    1) Build community centroids for both slices.
+    2) Estimate a coarse rigid transform using community transport pi_comm.
+    3) Transform source coordinates and compute cross-slice distances.
+    4) Robustly normalise by a quantile and clip to [0, 1].
+
+    This term discourages mapping a single local source region into multiple
+    distant target islands while still allowing unmatched mass through UOT.
+    """
+    q = float(np.clip(quantile, 0.50, 0.99))
+    pwr = float(max(1.0, distance_power))
+
+    unique_A = np.unique(comm_A)
+    unique_B = np.unique(comm_B)
+
+    cent_A = np.vstack([coords_A[comm_A == c].mean(axis=0) for c in unique_A])
+    cent_B = np.vstack([coords_B[comm_B == c].mean(axis=0) for c in unique_B])
+
+    # Fall back to identity-like behavior if any numerical issue occurs.
+    try:
+        R, t_src, t_tgt = _fit_weighted_rigid_transform(cent_A, cent_B, pi_comm)
+        coords_A_coarse = (R @ (coords_A - t_src).T).T + t_tgt
+    except Exception:
+        coords_A_coarse = np.asarray(coords_A, dtype=np.float64)
+
+    D = cdist(coords_A_coarse, coords_B)
+    scale = float(np.quantile(D, q))
+    if not np.isfinite(scale) or scale <= 0:
+        scale = float(D.max())
+    if scale <= 0:
+        return np.zeros_like(D, dtype=np.float64)
+
+    M = np.clip(D / (scale + 1e-12), 0.0, 1.0)
+    if pwr > 1.0:
+        M = M ** pwr
+    return M.astype(np.float64)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # M_anchor — community-level OT soft-gating
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -180,7 +282,7 @@ def _community_descriptor(
     comm_labels: np.ndarray,
     cell_types: np.ndarray,
     n_total: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """
     For each community compute:
       - mean diffusion signature
@@ -245,7 +347,9 @@ def compute_M_anchor(
     M_anchor       : (N_A, N_B) soft-gating cost matrix
     pi_comm        : (n_comm_A, n_comm_B) community transport plan
     """
-    import ot as _ot
+    import importlib
+
+    _ot = importlib.import_module("ot")
 
     desc_A, sizes_A = _community_descriptor(H_A, comm_A, cell_types_A, len(comm_A))
     desc_B, sizes_B = _community_descriptor(H_B, comm_B, cell_types_B, len(comm_B))
@@ -295,13 +399,26 @@ def compute_M_anchor(
 # Fused cost: normalise and sum
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fuse_costs(*matrices: np.ndarray) -> np.ndarray:
+def fuse_costs(*matrices: np.ndarray, weights: Optional[list[float]] = None) -> np.ndarray:
     """
     Return the unit-Frobenius-norm–normalised sum of all input matrices.
-    Each term contributes equally in magnitude regardless of raw scale.
+    By default each term contributes equally regardless of raw scale. Use
+    ``weights`` to up/down weight specific terms after normalisation.
     """
+    if len(matrices) == 0:
+        raise ValueError("fuse_costs requires at least one matrix")
+
+    if weights is None:
+        weights_arr = np.ones(len(matrices), dtype=np.float64)
+    else:
+        if len(weights) != len(matrices):
+            raise ValueError("weights must have the same length as matrices")
+        weights_arr = np.asarray(weights, dtype=np.float64)
+
     total = np.zeros_like(matrices[0], dtype=np.float64)
-    for M in matrices:
+    for w, M in zip(weights_arr, matrices):
+        if w <= 0:
+            continue
         fro = np.linalg.norm(M, 'fro')
-        total += M / (fro + 1e-12)
+        total += float(w) * (M / (fro + 1e-12))
     return total

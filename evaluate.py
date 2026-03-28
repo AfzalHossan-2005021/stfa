@@ -150,6 +150,18 @@ def get_perf_metrics_enhanced(
     max_entropy = float(np.log(N_A * N_B))
     entropy_pct = entropy / max_entropy * 100
 
+    # ── 4b. Effective support (confidence) in both directions ───────────────
+    # exp(H) is the entropy-equivalent number of active correspondences.
+    # Lower is tighter/more confident.
+    row_mass_safe = row_mass[:, None] + 1e-12
+    col_mass_safe = pi12.sum(axis=0, keepdims=True) + 1e-12
+    row_cond = pi12 / row_mass_safe
+    col_cond = pi12 / col_mass_safe
+    row_entropy = -np.sum(row_cond * np.log(row_cond + 1e-12), axis=1)
+    col_entropy = -np.sum(col_cond * np.log(col_cond + 1e-12), axis=0)
+    eff_targets_per_source = float(np.mean(np.exp(row_entropy)))
+    eff_sources_per_target = float(np.mean(np.exp(col_entropy)))
+
     # ── 5. Rare cell-type recall ──────────────────────────────────────────────
     all_types  = new_slices[0].obs['cell_type_annot']
     type_freq  = all_types.value_counts(normalize=True)
@@ -193,7 +205,11 @@ def get_perf_metrics_enhanced(
     print(f"  Spatial RMSE                   {spatial_rmse:.4f} (coord units)")
     print(f"  k-NN NSP (k={k_nn})             {nsp:.4f}%")
     print(f"  Transport Entropy              {entropy_pct:.2f}% of max "
-          f"(low = confident)")
+        f"(low = confident)")
+    print(f"  Effective Targets / Source     {eff_targets_per_source:.3f} "
+        f"(low = tighter)")
+    print(f"  Effective Sources / Target     {eff_sources_per_target:.3f} "
+        f"(low = tighter)")
     print(f"  Rare Cell-Type Recall          {rare_str}")
     print(f"  Symmetry Ambiguity Score       {sym_ambig:.4f} "
           f"(1.0 = fully ambiguous)")
@@ -211,6 +227,8 @@ def get_perf_metrics_enhanced(
         'spatial_rmse':       spatial_rmse,
         'nsp_pct':            nsp,
         'entropy_pct':        entropy_pct,
+        'eff_targets_per_source': eff_targets_per_source,
+        'eff_sources_per_target': eff_sources_per_target,
         'rare_cell_recall_pct': rare_recall,
         'symmetry_ambiguity': sym_ambig,
     }

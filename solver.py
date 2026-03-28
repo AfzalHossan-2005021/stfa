@@ -104,6 +104,44 @@ def _norm_dist(D: np.ndarray) -> np.ndarray:
     return D / (m + 1e-12) if m > 0 else D
 
 
+def _bidir_power_sharpen(
+    pi: np.ndarray,
+    power: float = 1.0,
+    rounds: int = 1,
+) -> np.ndarray:
+    """
+    Sharpen transport conditionals in both directions.
+
+    A mild power transform (power > 1) reduces diffuse many-to-many links while
+    preserving current row/column mass profiles at each alternating step.
+    """
+    pwr = float(power)
+    n_rounds = int(rounds)
+    if pwr <= 1.0 or n_rounds <= 0:
+        return np.asarray(pi, dtype=np.float64)
+
+    out = np.clip(np.asarray(pi, dtype=np.float64), 0.0, None)
+
+    for _ in range(n_rounds):
+        # Row-wise sharpening: one source -> fewer targets.
+        row_mass = out.sum(axis=1, keepdims=True)
+        nz_row = row_mass[:, 0] > 0
+        if np.any(nz_row):
+            row_sharp = np.power(out[nz_row, :], pwr)
+            row_sharp /= row_sharp.sum(axis=1, keepdims=True) + 1e-12
+            out[nz_row, :] = row_sharp * row_mass[nz_row, :]
+
+        # Column-wise sharpening: one target <- fewer sources.
+        col_mass = out.sum(axis=0, keepdims=True)
+        nz_col = col_mass[0, :] > 0
+        if np.any(nz_col):
+            col_sharp = np.power(out[:, nz_col], pwr)
+            col_sharp /= col_sharp.sum(axis=0, keepdims=True) + 1e-12
+            out[:, nz_col] = col_sharp * col_mass[:, nz_col]
+
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Unbalanced FGW solver
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,6 +157,8 @@ def solve_ufgw(
     eps: float = 0.05,
     n_iter: int = 200,
     tol: float = 1e-7,
+    confidence_power: float = 1.0,
+    confidence_rounds: int = 1,
     verbose: bool = False,
 ) -> np.ndarray:
     """
@@ -145,6 +185,8 @@ def solve_ufgw(
     eps       : entropic regularisation for mm_unbalanced (smoother gradients)
     n_iter    : max CG iterations
     tol       : convergence threshold on |Δcost|/|cost|
+    confidence_power  : >1 sharpens couplings toward one-to-few correspondences
+    confidence_rounds : alternating row/column sharpening rounds per OT step
 
     Returns
     -------
@@ -184,7 +226,12 @@ def solve_ufgw(
                 pi_new = ot.emd(p_A, p_B, M_pos)
             except Exception:
                 pi_new = np.outer(p_A, p_B)
-        return np.asarray(pi_new, dtype=np.float64)
+        pi_new = np.asarray(pi_new, dtype=np.float64)
+        return _bidir_power_sharpen(
+            pi_new,
+            power=confidence_power,
+            rounds=confidence_rounds,
+        )
 
     # ── Helper: total cost ────────────────────────────────────────────────────
     def _total_cost(pi_cur: np.ndarray) -> float:
@@ -228,4 +275,8 @@ def solve_ufgw(
             break
         prev_cost = cur_cost
 
-    return pi
+    return _bidir_power_sharpen(
+        pi,
+        power=confidence_power,
+        rounds=confidence_rounds,
+    )

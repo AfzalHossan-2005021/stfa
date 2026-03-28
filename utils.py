@@ -251,6 +251,8 @@ def visualize_alignment_unbalanced(
     sliceB: AnnData,
     pi12: np.ndarray,
     n_arrows: int = 300,
+    links_per_source: int = 2,
+    min_link_ratio: float = 0.35,
     figsize: tuple = (18, 6),
     title: str = "STFA Unbalanced Alignment",
 ) -> List[AnnData]:
@@ -266,7 +268,6 @@ def visualize_alignment_unbalanced(
     new_slices : aligned AnnData list (same as stack_slices_pairwise output)
     """
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
 
     new_slices = stack_slices_pairwise([sliceA, sliceB], [pi12])
     s1 = new_slices[0].obsm['spatial']
@@ -309,8 +310,41 @@ def visualize_alignment_unbalanced(
     ax = axes[2]
     ax.scatter(s1[:, 0], s1[:, 1], s=1, c='#f87171', alpha=0.35, label='Source')
     ax.scatter(s2[:, 0], s2[:, 1], s=1, c='#60a5fa', alpha=0.35, label='Target')
-    flat_idx = np.argsort(pi12.ravel())[-n_arrows:]
-    src_idx, tgt_idx = np.unravel_index(flat_idx, pi12.shape)
+
+    # Prefer confidence-filtered links over global top-N flattening, which can
+    # over-represent tiny diffuse tails in unbalanced transport plans.
+    row_max = pi12.max(axis=1)
+    candidate_src: list[int] = []
+    candidate_tgt: list[int] = []
+    candidate_mass: list[float] = []
+    k_src = int(max(1, links_per_source))
+    ratio = float(np.clip(min_link_ratio, 0.0, 1.0))
+
+    for si in range(pi12.shape[0]):
+        row = pi12[si]
+        if row.size <= k_src:
+            top_idx = np.arange(row.size)
+        else:
+            top_idx = np.argpartition(row, -k_src)[-k_src:]
+
+        thr = ratio * (row_max[si] + 1e-12)
+        keep = top_idx[row[top_idx] >= thr]
+        if keep.size == 0:
+            keep = np.array([int(np.argmax(row))])
+
+        for tj in keep:
+            candidate_src.append(si)
+            candidate_tgt.append(int(tj))
+            candidate_mass.append(float(row[tj]))
+
+    if len(candidate_mass) > n_arrows:
+        order = np.argsort(candidate_mass)[-n_arrows:]
+        src_idx = np.asarray(candidate_src, dtype=int)[order]
+        tgt_idx = np.asarray(candidate_tgt, dtype=int)[order]
+    else:
+        src_idx = np.asarray(candidate_src, dtype=int)
+        tgt_idx = np.asarray(candidate_tgt, dtype=int)
+
     max_pi = pi12.max() + 1e-12
     for si, ti in zip(src_idx, tgt_idx):
         alpha_val = float(pi12[si, ti] / max_pi) * 0.55 + 0.1

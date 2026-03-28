@@ -20,7 +20,16 @@ from sklearn.metrics.pairwise import cosine_distances
 from typing import Optional, Tuple
 
 from .graph import build_knn_graph, compute_diffusion_signatures, detect_communities
-from .costs import compute_M_gene, compute_M_celltype, compute_M_neighborhood, compute_M_topo, compute_M_boundary, compute_M_anchor, fuse_costs
+from .costs import (
+    compute_M_gene,
+    compute_M_celltype,
+    compute_M_neighborhood,
+    compute_M_topo,
+    compute_M_boundary,
+    compute_M_anchor,
+    compute_M_compact,
+    fuse_costs,
+)
 from .solver import estimate_overlap_fraction, calibrate_rho, solve_ufgw, _norm_dist
 from .utils import neighborhood_distribution, jensenshannon_divergence_backend
 
@@ -54,6 +63,10 @@ def pairwise_align_stfa(
     eps: float = 0.05,
     k_min: int = 10,
     k_max: int = 30,
+    compactness_weight: float = 1.0,
+    compactness_quantile: float = 0.90,
+    confidence_power: float = 1.30,
+    confidence_rounds: int = 1,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, float, float, float, float]:
     """
@@ -73,6 +86,10 @@ def pairwise_align_stfa(
     n_iter    : max UFGW conditional-gradient iterations
     eps       : entropic regularisation for mm_unbalanced
     k_min/max : adaptive k-NN graph search range
+    compactness_weight   : weight of compactness cost in fused linear term
+    compactness_quantile : robust scaling quantile for compactness distances
+    confidence_power     : >1 sharpens row/column conditionals (one-to-few)
+    confidence_rounds    : alternating row/column sharpening rounds
     verbose   : print solver progress
 
     Returns
@@ -98,8 +115,8 @@ def pairwise_align_stfa(
     cell_types_A = np.asarray(sA.obs['cell_type_annot'].values)
     cell_types_B = np.asarray(sB.obs['cell_type_annot'].values)
 
-    coords_A = sA.obsm['spatial']
-    coords_B = sB.obsm['spatial']
+    coords_A = np.asarray(sA.obsm['spatial'], dtype=np.float64)
+    coords_B = np.asarray(sB.obsm['spatial'], dtype=np.float64)
 
     if verbose:
         print(f"[STFA] Slices: {N_A} × {N_B} cells | {len(shared_genes)} shared genes")
@@ -133,14 +150,31 @@ def pairwise_align_stfa(
 
     # ── 3. Assemble fused cost ────────────────────────────────────────────────
     if verbose:
-        print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor) ...")
+        print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor, compactness) ...")
     M_gene         = compute_M_gene(sA, sB, use_rep=use_rep)
     M_celltype     = compute_M_celltype(sA, sB)
     M_neighborhood = compute_M_neighborhood(sA, sB, radius=radius)
     M_topo         = compute_M_topo(H_A, H_B)
     M_boundary     = compute_M_boundary(adj_A, adj_B)
+    M_compact      = compute_M_compact(
+        coords_A,
+        coords_B,
+        comm_A,
+        comm_B,
+        pi_comm,
+        quantile=compactness_quantile,
+    )
 
-    M_fused        = fuse_costs(M_gene, M_celltype, M_neighborhood, M_topo, M_boundary, M_anchor)
+    M_fused        = fuse_costs(
+        M_gene,
+        M_celltype,
+        M_neighborhood,
+        M_topo,
+        M_boundary,
+        M_anchor,
+        M_compact,
+        weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, float(max(0.0, compactness_weight))],
+    )
 
     # ── 4. Geometry matrices ──────────────────────────────────────────────────
     from scipy.spatial.distance import cdist
@@ -178,7 +212,10 @@ def pairwise_align_stfa(
     pi12 = solve_ufgw(
         p_A, p_B, M_fused, C_A, C_B,
         rho=rho, gamma=gamma, eps=eps,
-        n_iter=n_iter, verbose=verbose,
+        n_iter=n_iter,
+        confidence_power=confidence_power,
+        confidence_rounds=confidence_rounds,
+        verbose=verbose,
     )
 
     # ── 8. Final objectives ───────────────────────────────────────────────────
