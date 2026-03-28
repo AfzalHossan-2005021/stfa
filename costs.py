@@ -18,6 +18,8 @@ from sklearn.metrics.pairwise import cosine_distances
 from anndata import AnnData
 from typing import Optional
 
+from stfa.utils import jensenshannon_divergence_backend, neighborhood_distribution
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # M_gene  — gene expression cosine distance
@@ -47,6 +49,52 @@ def compute_M_gene(
     B = _get(sliceB, use_rep) + 1e-8
     return cosine_distances(A, B).astype(np.float64)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# M_celltype  — cell-type mismatch penalty
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_M_celltype(
+    sliceA: AnnData,
+    sliceB: AnnData,
+) -> np.ndarray:
+    """
+    Binary cost matrix where M_celltype(i,j) = 1 if cell types differ, else 0.
+
+    Returns
+    -------
+    M : (N_A, N_B) float64 array with values in {0, 1}
+    """
+    ct_A = np.asarray(sliceA.obs['cell_type_annot'].values)
+    ct_B = np.asarray(sliceB.obs['cell_type_annot'].values)
+    M = (ct_A[:, None] != ct_B[None, :]).astype(np.float64)
+    return M
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# M_neighborhood — local neighborhood distribution divergence
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_M_neighborhood(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    radius: float = 100.0,
+) -> np.ndarray:
+    """
+    Jensen-Shannon divergence between local neighborhood distributions.
+
+    For each cell, compute the distribution of cell types within a fixed
+    radius in spatial coordinates. Then compute the JSD between these
+    distributions for all pairs of cells across slices.
+
+    Returns
+    -------
+    M : (N_A, N_B) float64 array with values in [0, 1]
+    """
+    dist_A = neighborhood_distribution(sliceA, radius) + 1e-6
+    dist_B = neighborhood_distribution(sliceB, radius) + 1e-6
+    M = jensenshannon_divergence_backend(dist_A, dist_B)
+    return M.astype(np.float64)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # M_topo  — topology via multi-scale diffusion signatures

@@ -20,7 +20,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from typing import Optional, Tuple
 
 from .graph import build_knn_graph, compute_diffusion_signatures, detect_communities
-from .costs import compute_M_gene, compute_M_topo, compute_M_boundary, compute_M_anchor, fuse_costs
+from .costs import compute_M_gene, compute_M_celltype, compute_M_neighborhood, compute_M_topo, compute_M_boundary, compute_M_anchor, fuse_costs
 from .solver import estimate_overlap_fraction, calibrate_rho, solve_ufgw, _norm_dist
 from .utils import neighborhood_distribution, jensenshannon_divergence_backend
 
@@ -32,7 +32,7 @@ from .utils import neighborhood_distribution, jensenshannon_divergence_backend
 def _compute_objectives(
     pi_mat: np.ndarray,
     jsd_neighborhood: np.ndarray,
-    cosine_gene: np.ndarray,
+    cosine_gene: np.ndarray
 ) -> Tuple[float, float]:
     """Weighted-sum objectives from a transport plan and pre-computed cost matrices."""
     obj_neighbor = float(np.sum(jsd_neighborhood * pi_mat))
@@ -133,11 +133,14 @@ def pairwise_align_stfa(
 
     # ── 3. Assemble fused cost ────────────────────────────────────────────────
     if verbose:
-        print("[STFA] Stage 3: Computing fused cost (gene, topo, boundary, anchor) ...")
-    M_gene     = compute_M_gene(sA, sB, use_rep=use_rep)
-    M_topo     = compute_M_topo(H_A, H_B)
-    M_boundary = compute_M_boundary(adj_A, adj_B)
-    M_fused    = fuse_costs(M_gene, M_topo, M_boundary, M_anchor)
+        print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor) ...")
+    M_gene         = compute_M_gene(sA, sB, use_rep=use_rep)
+    M_celltype     = compute_M_celltype(sA, sB)
+    M_neighborhood = compute_M_neighborhood(sA, sB, radius=radius)
+    M_topo         = compute_M_topo(H_A, H_B)
+    M_boundary     = compute_M_boundary(adj_A, adj_B)
+
+    M_fused        = fuse_costs(M_gene, M_celltype, M_neighborhood, M_topo, M_boundary, M_anchor)
 
     # ── 4. Geometry matrices ──────────────────────────────────────────────────
     from scipy.spatial.distance import cdist
