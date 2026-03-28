@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 from anndata import AnnData
 from typing import List, Optional
+from scipy.spatial.distance import cdist
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -26,12 +27,13 @@ def cell_type_matching_metric(sliceA: AnnData, sliceB: AnnData, pi_mat: np.ndarr
     Expected fraction (%) of transport mass that lands on the correct cell type.
     Probabilistic: works for soft/unbalanced transport plans.
     """
+    pi_arr = np.asarray(pi_mat, dtype=np.float64)
     expected_matches = 0.0
     for i in range(sliceA.n_obs):
         src_type = sliceA.obs.iloc[i]['cell_type_annot']
-        match_mask = (sliceB.obs['cell_type_annot'] == src_type).values
-        expected_matches += float(np.sum(pi_mat[i, match_mask]))
-    total_mass = pi_mat.sum()
+        match_mask = np.asarray(sliceB.obs['cell_type_annot'].values == src_type, dtype=bool)
+        expected_matches += float(np.sum(pi_arr[i, match_mask]))
+    total_mass = float(pi_arr.sum())
     if total_mass > 0:
         return (expected_matches / total_mass) * 100.0
     return 0.0
@@ -83,7 +85,7 @@ def get_perf_metrics_enhanced(
     k_nn: int = 15,
 ) -> dict:
     """
-    Extended performance report with 6 biologically motivated additions:
+    Extended performance report with 7 biologically motivated additions:
 
     1.  Unmatched mass fraction  D_global      — tissue overlap quality
     2.  Spatial residual RMSE                  — geometric alignment error
@@ -91,12 +93,95 @@ def get_perf_metrics_enhanced(
     4.  Transport entropy                       — symmetry confidence
     5.  Rare cell-type recall (< 1% freq)      — cross-temporal sensitivity
     6.  Symmetry ambiguity score               — whether top-2 targets compete
+    7.  Mapped-region geometry consistency      — internal shape preservation
 
     Returns a dict of all metric values (for programmatic use).
     """
     from sklearn.neighbors import NearestNeighbors
 
-    N_A, N_B = pi12.shape
+    pi_arr = np.asarray(pi12, dtype=np.float64)
+
+    def _weighted_rigid_fit(src: np.ndarray, tgt: np.ndarray, w: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        w = np.asarray(w, dtype=np.float64)
+        mass = float(w.sum())
+        if mass <= 0:
+            return np.eye(2, dtype=np.float64), np.zeros(2, dtype=np.float64), np.zeros(2, dtype=np.float64)
+
+        ws = w / (mass + 1e-12)
+        c_src = (ws[:, None] * src).sum(axis=0)
+        c_tgt = (ws[:, None] * tgt).sum(axis=0)
+        src_c = src - c_src
+        tgt_c = tgt - c_tgt
+
+        H = (src_c * ws[:, None]).T @ tgt_c
+        U, _, Vt = np.linalg.svd(H, full_matrices=False)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1.0
+            R = Vt.T @ U.T
+
+        return R.astype(np.float64), c_src.astype(np.float64), c_tgt.astype(np.float64)
+
+    def _norm_pairwise(D: np.ndarray) -> np.ndarray:
+        tri = D[np.triu_indices_from(D, k=1)]
+        tri = tri[np.isfinite(tri)]
+        tri = tri[tri > 0]
+        if tri.size == 0:
+            return D
+        scale = float(np.median(tri))
+        if scale <= 0:
+            return D
+        return D / (scale + 1e-12)
+
+    def _mapped_region_geometry(pi: np.ndarray, src_xy: np.ndarray, tgt_xy: np.ndarray) -> tuple[float, float]:
+        row_mass_loc = pi.sum(axis=1)
+        valid = row_mass_loc > 1e-12
+        if int(valid.sum()) < 5:
+            return float('nan'), float('nan')
+
+        # Focus on cells that actually carry transport mass (mapped region).
+        nz = row_mass_loc[valid]
+        q = float(np.quantile(nz, 0.35))
+        keep = row_mass_loc >= max(1e-12, q)
+        if int(keep.sum()) < 5:
+            keep = valid
+
+        row_safe = row_mass_loc[:, None] + 1e-12
+        bary = (pi / row_safe) @ tgt_xy
+
+        src_sel = np.asarray(src_xy[keep], dtype=np.float64)
+        bary_sel = np.asarray(bary[keep], dtype=np.float64)
+        w_sel = np.asarray(row_mass_loc[keep], dtype=np.float64)
+        if src_sel.shape[0] < 5:
+            return float('nan'), float('nan')
+
+        R, c_src, c_tgt = _weighted_rigid_fit(src_sel, bary_sel, w_sel)
+        src_aligned = (R @ (src_sel - c_src).T).T + c_tgt
+
+        D_src = _norm_pairwise(cdist(src_aligned, src_aligned))
+        D_tgt = _norm_pairwise(cdist(bary_sel, bary_sel))
+
+        tri_idx = np.triu_indices(src_sel.shape[0], k=1)
+        x = D_src[tri_idx]
+        y = D_tgt[tri_idx]
+
+        finite = np.isfinite(x) & np.isfinite(y)
+        x = x[finite]
+        y = y[finite]
+        if x.size < 5:
+            return float('nan'), float('nan')
+
+        x_std = float(np.std(x))
+        y_std = float(np.std(y))
+        if x_std <= 1e-12 or y_std <= 1e-12:
+            corr = float('nan')
+        else:
+            corr = float(np.corrcoef(x, y)[0, 1])
+
+        stress = float(np.sqrt(np.sum((x - y) ** 2) / (np.sum(x ** 2) + 1e-12)))
+        return corr, stress
+
+    N_A, N_B = pi_arr.shape
     p_A = np.ones(N_A) / N_A
 
     # ── Original three ──────────────────────────────────────────────────────
@@ -106,21 +191,21 @@ def get_perf_metrics_enhanced(
     gene_expr_improvement = (
         (initial_obj_gene_cos - obj_gene_cos) / (initial_obj_gene_cos + 1e-12) * 100
     )
-    expected_matches = cell_type_matching_metric(new_slices[0], new_slices[1], pi12)
+    expected_matches = cell_type_matching_metric(new_slices[0], new_slices[1], pi_arr)
 
     # ── 1. Unmatched mass fraction ────────────────────────────────────────────
     # Under KL-unbalanced OT the plan does NOT sum to 1/N_A per row.
     # D_global = fraction of source mass not transported anywhere.
-    row_mass = pi12.sum(axis=1)                  # (N_A,)
+    row_mass = pi_arr.sum(axis=1)                  # (N_A,)
     D_local  = np.clip(p_A - row_mass, 0, None)  # (N_A,) per-cell destroyed mass
     D_global = float(D_local.sum())               # fraction ∈ [0, 1]
 
     # ── 2. Spatial residual RMSE ──────────────────────────────────────────────
-    s1 = new_slices[0].obsm['spatial']
-    s2 = new_slices[1].obsm['spatial']
+    s1 = np.asarray(new_slices[0].obsm['spatial'], dtype=np.float64)
+    s2 = np.asarray(new_slices[1].obsm['spatial'], dtype=np.float64)
     pi_row_safe = row_mass[:, None] + 1e-12
     # Weighted average target position for each source cell
-    src_mapped = (pi12 / pi_row_safe) @ s2          # (N_A, 2)
+    src_mapped = (pi_arr / pi_row_safe) @ s2          # (N_A, 2)
     residuals  = np.linalg.norm(s1 - src_mapped, axis=1)
     # Weight RMSE by how much mass each cell actually transported
     match_weight = row_mass * N_A                    # ~1 for matched, ~0 for unmatched
@@ -133,7 +218,7 @@ def get_perf_metrics_enhanced(
     nn_s2 = NearestNeighbors(n_neighbors=k_nn).fit(s2)
     _, idx_s1 = nn_s1.kneighbors(s1)
     _, idx_s2 = nn_s2.kneighbors(s2)
-    best_match = np.argmax(pi12, axis=1)          # greedy 1-1 for NSP
+    best_match = np.argmax(pi_arr, axis=1)          # greedy 1-1 for NSP
 
     nsp_scores = []
     for i in range(N_A):
@@ -145,7 +230,7 @@ def get_perf_metrics_enhanced(
     nsp = float(np.mean(nsp_scores) * 100)
 
     # ── 4. Transport entropy ─────────────────────────────────────────────────
-    pi_norm    = pi12 / (pi12.sum() + 1e-12)
+    pi_norm    = pi_arr / (pi_arr.sum() + 1e-12)
     entropy    = float(-np.sum(pi_norm * np.log(pi_norm + 1e-12)))
     max_entropy = float(np.log(N_A * N_B))
     entropy_pct = entropy / max_entropy * 100
@@ -154,9 +239,9 @@ def get_perf_metrics_enhanced(
     # exp(H) is the entropy-equivalent number of active correspondences.
     # Lower is tighter/more confident.
     row_mass_safe = row_mass[:, None] + 1e-12
-    col_mass_safe = pi12.sum(axis=0, keepdims=True) + 1e-12
-    row_cond = pi12 / row_mass_safe
-    col_cond = pi12 / col_mass_safe
+    col_mass_safe = pi_arr.sum(axis=0, keepdims=True) + 1e-12
+    row_cond = pi_arr / row_mass_safe
+    col_cond = pi_arr / col_mass_safe
     row_entropy = -np.sum(row_cond * np.log(row_cond + 1e-12), axis=1)
     col_entropy = -np.sum(col_cond * np.log(col_cond + 1e-12), axis=0)
     eff_targets_per_source = float(np.mean(np.exp(row_entropy)))
@@ -169,7 +254,8 @@ def get_perf_metrics_enhanced(
 
     if rare_types:
         rare_mask = new_slices[0].obs['cell_type_annot'].isin(rare_types).values
-        pi_rare   = pi12[rare_mask, :]
+        rare_mask = np.asarray(rare_mask, dtype=bool)
+        pi_rare   = pi_arr[rare_mask, :]
         rare_recall = cell_type_matching_metric(
             new_slices[0][rare_mask], new_slices[1], pi_rare
         )
@@ -179,10 +265,13 @@ def get_perf_metrics_enhanced(
         rare_str = "N/A (no cell types < 1%)"
 
     # ── 6. Symmetry ambiguity score ───────────────────────────────────────────
-    sorted_rows = np.sort(pi12, axis=1)          # ascending
+    sorted_rows = np.sort(pi_arr, axis=1)          # ascending
     top1  = sorted_rows[:, -1] + 1e-12
     top2  = sorted_rows[:, -2] + 1e-12
     sym_ambig = float(np.mean(top2 / top1))      # 1.0 = fully ambiguous
+
+    # ── 7. Mapped-region internal geometry consistency ───────────────────────
+    mapped_geom_corr, mapped_geom_stress = _mapped_region_geometry(pi_arr, s1, s2)
 
     # ── Report ────────────────────────────────────────────────────────────────
     sep = '═' * 60
@@ -213,6 +302,16 @@ def get_perf_metrics_enhanced(
     print(f"  Rare Cell-Type Recall          {rare_str}")
     print(f"  Symmetry Ambiguity Score       {sym_ambig:.4f} "
           f"(1.0 = fully ambiguous)")
+    if np.isfinite(mapped_geom_corr):
+        print(f"  Mapped Geometry Corr (R)       {mapped_geom_corr:.4f} "
+              f"(high = better)")
+    else:
+        print("  Mapped Geometry Corr (R)       N/A")
+    if np.isfinite(mapped_geom_stress):
+        print(f"  Mapped Geometry Stress         {mapped_geom_stress:.4f} "
+              f"(low = better)")
+    else:
+        print("  Mapped Geometry Stress         N/A")
     print(f"{sep}\n")
 
     return {
@@ -231,4 +330,6 @@ def get_perf_metrics_enhanced(
         'eff_sources_per_target': eff_sources_per_target,
         'rare_cell_recall_pct': rare_recall,
         'symmetry_ambiguity': sym_ambig,
+        'mapped_geom_corr': mapped_geom_corr,
+        'mapped_geom_stress': mapped_geom_stress,
     }

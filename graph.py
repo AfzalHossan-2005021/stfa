@@ -125,7 +125,8 @@ def compute_diffusion_signatures(
     # Cap to avoid O(N·t) blowup
     timescales = [min(t, n_power_iter) for t in timescales]
 
-    features = []
+    # Compute unique powers once, then replicate for duplicate requested scales.
+    cache = {}
     Xt = X.copy()
     prev_t = 0
     for t in sorted(set(timescales)):
@@ -133,7 +134,9 @@ def compute_diffusion_signatures(
         for _ in range(steps):
             Xt = P @ Xt
         prev_t = t
-        features.append(Xt.copy())
+        cache[t] = Xt.copy()
+
+    features = [cache[t] for t in timescales]
 
     H = np.hstack(features)         # (N, K·3)
     # L2-normalise each row for cosine-distance compatibility

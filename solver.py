@@ -196,18 +196,37 @@ def solve_ufgw(
 
     N_A, N_B = M_fused.shape
 
+    # Pre-compute for square-loss GW terms.
+    C_A_sq = C_A * C_A
+    C_B_sq = C_B * C_B
+
     # ── Initialise with outer product (independent coupling) ─────────────────
     pi = np.outer(p_A, p_B)
 
     # ── Helper: GW gradient ──────────────────────────────────────────────────
     def _gw_grad(pi_cur: np.ndarray) -> np.ndarray:
-        """∂GW/∂π = 4 (C_A · π · C_B)  for square loss."""
-        return 4.0 * (C_A @ pi_cur @ C_B)
+        """
+        Gradient of square-loss GW with variable (unbalanced) marginals.
+
+        GW(π) = <C_A^2, r r^T> + <C_B^2, c c^T> - 2 <C_A π C_B, π>
+        where r = π1 and c = π^T1.
+        """
+        row = pi_cur.sum(axis=1)  # r
+        col = pi_cur.sum(axis=0)  # c
+
+        term_a = 2.0 * (C_A_sq @ row)[:, None]
+        term_b = 2.0 * (C_B_sq @ col)[None, :]
+        cross = 4.0 * (C_A @ pi_cur @ C_B)
+        return term_a + term_b - cross
 
     # ── Helper: scalar GW cost ────────────────────────────────────────────────
     def _gw_cost(pi_cur: np.ndarray) -> float:
-        T1 = np.einsum('ij,ij->', C_A @ pi_cur @ C_B, pi_cur)
-        return float(4.0 * T1)
+        row = pi_cur.sum(axis=1)
+        col = pi_cur.sum(axis=0)
+        term_a = float(row @ (C_A_sq @ row))
+        term_b = float(col @ (C_B_sq @ col))
+        cross = float(np.einsum('ij,ij->', C_A @ pi_cur @ C_B, pi_cur))
+        return term_a + term_b - 2.0 * cross
 
     # ── Helper: unbalanced OT step ────────────────────────────────────────────
     def _ot_step(M_lin: np.ndarray) -> np.ndarray:

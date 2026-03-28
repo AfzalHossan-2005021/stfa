@@ -5,6 +5,7 @@ All pairwise cost matrix computations for the STFA pipeline:
   - M_gene    : cosine distance on (optionally latent) gene expression
   - M_topo    : cosine distance on multi-scale diffusion signatures
   - M_boundary: soft boundary-uncertainty penalty
+    - M_shape   : local shape-context mismatch (rotation/translation invariant)
   - M_anchor  : community-level OT soft-gating cost
   - fuse_costs: unit-Frobenius normalised sum
 """
@@ -16,6 +17,7 @@ import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import cosine_distances
+from sklearn.neighbors import NearestNeighbors
 from anndata import AnnData
 from typing import Optional
 
@@ -141,7 +143,6 @@ def _boundary_weights(adj: sp.csr_matrix) -> np.ndarray:
         raise ValueError("adj must be a valid sparse adjacency matrix")
 
     adj_csr = sp.csr_matrix(adj)
-
     shape = adj_csr.shape
     if shape is None:
         raise ValueError("adjacency matrix must define shape")
@@ -177,6 +178,125 @@ def compute_M_boundary(
     u_A = _boundary_weights(adj_A)    # (N_A,)
     u_B = _boundary_weights(adj_B)    # (N_B,)
     M = 1.0 - np.outer(u_A, u_B)     # (N_A, N_B)
+    return M.astype(np.float64)
+
+
+def _local_shape_context_descriptors(
+    coords: np.ndarray,
+    k_neighbors: int = 24,
+    n_radial_bins: int = 6,
+    n_angular_bins: int = 12,
+    n_fourier: int = 4,
+) -> np.ndarray:
+    """
+    Compute rotation/translation/scale-invariant local shape descriptors.
+
+    Descriptor components per cell:
+      - log-radial histogram of neighbour distances (scale-normalised)
+      - magnitudes of low-frequency Fourier modes of angular histogram
+      - scalar moments [mean distance, std distance, anisotropy]
+    """
+    pts = np.asarray(coords, dtype=np.float64)
+    n = int(pts.shape[0])
+
+    n_r = int(max(3, n_radial_bins))
+    n_a = int(max(8, n_angular_bins))
+    n_f = int(max(2, n_fourier))
+    d_dim = n_r + n_f + 3
+
+    if n == 0:
+        return np.zeros((0, d_dim), dtype=np.float64)
+    if n == 1:
+        return np.zeros((1, d_dim), dtype=np.float64)
+
+    k = int(max(1, min(k_neighbors, n - 1)))
+    nn = NearestNeighbors(n_neighbors=k + 1, algorithm='auto')
+    nn.fit(pts)
+    _, nbr_idx = nn.kneighbors(pts, return_distance=True)
+    nbr_idx = nbr_idx[:, 1:]  # drop self
+
+    radial_edges = np.geomspace(0.25, 4.0, num=n_r + 1)
+    angular_edges = np.linspace(-np.pi, np.pi, num=n_a + 1)
+
+    out = np.zeros((n, d_dim), dtype=np.float64)
+    for i in range(n):
+        neighbors = pts[nbr_idx[i]]
+        vec = neighbors - pts[i]
+        dist = np.linalg.norm(vec, axis=1) + 1e-12
+
+        local_scale = np.median(dist) + 1e-12
+        dist_n = dist / local_scale
+
+        h_r, _ = np.histogram(dist_n, bins=radial_edges)
+        h_r = h_r.astype(np.float64)
+        h_r /= h_r.sum() + 1e-12
+
+        ang = np.arctan2(vec[:, 1], vec[:, 0])
+        h_a, _ = np.histogram(ang, bins=angular_edges)
+        h_a = h_a.astype(np.float64)
+
+        # Rotation-invariant angular statistics from Fourier magnitudes.
+        fft_mag = np.abs(np.fft.rfft(h_a))
+        ang_inv = fft_mag[1:1 + n_f]
+        if ang_inv.size < n_f:
+            ang_inv = np.pad(ang_inv, (0, n_f - ang_inv.size), mode='constant')
+        ang_inv = ang_inv / (h_a.sum() + 1e-12)
+
+        if vec.shape[0] >= 2:
+            cov = np.cov((vec / local_scale).T)
+        else:
+            cov = np.eye(2, dtype=np.float64)
+
+        eig = np.linalg.eigvalsh(cov)
+        eig = np.clip(np.sort(eig), 0.0, None)
+        anis = float((eig[-1] - eig[0]) / (eig[-1] + eig[0] + 1e-12))
+
+        mean_d = float(np.mean(dist_n))
+        std_d = float(np.std(dist_n))
+
+        out[i] = np.concatenate([h_r, ang_inv, [mean_d, std_d, anis]])
+
+    norms = np.linalg.norm(out, axis=1, keepdims=True) + 1e-12
+    return out / norms
+
+
+def compute_M_shape_context(
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    k_neighbors: int = 24,
+    n_radial_bins: int = 6,
+    n_angular_bins: int = 12,
+    n_fourier: int = 4,
+    shape_power: float = 1.0,
+) -> np.ndarray:
+    """
+    Cross-slice local shape-context mismatch cost.
+
+    The descriptor is designed to be robust to translation, rotation and slight
+    deformations while preserving discriminative local morphology (e.g. circular
+    rim vs triangular corner-like neighborhoods).
+    """
+    pwr = float(max(1.0, shape_power))
+
+    desc_A = _local_shape_context_descriptors(
+        coords_A,
+        k_neighbors=k_neighbors,
+        n_radial_bins=n_radial_bins,
+        n_angular_bins=n_angular_bins,
+        n_fourier=n_fourier,
+    )
+    desc_B = _local_shape_context_descriptors(
+        coords_B,
+        k_neighbors=k_neighbors,
+        n_radial_bins=n_radial_bins,
+        n_angular_bins=n_angular_bins,
+        n_fourier=n_fourier,
+    )
+
+    M = cosine_distances(desc_A, desc_B)
+    M = np.clip(M / 2.0, 0.0, 1.0)
+    if pwr > 1.0:
+        M = M ** pwr
     return M.astype(np.float64)
 
 
@@ -268,6 +388,75 @@ def compute_M_compact(
         return np.zeros_like(D, dtype=np.float64)
 
     M = np.clip(D / (scale + 1e-12), 0.0, 1.0)
+    if pwr > 1.0:
+        M = M ** pwr
+    return M.astype(np.float64)
+
+
+def _normalised_distance_features(D: np.ndarray) -> np.ndarray:
+    """
+    Row-wise scale and L2 normalisation for distance-based geometry features.
+    """
+    D = np.asarray(D, dtype=np.float64)
+    row_scale = D.mean(axis=1, keepdims=True) + 1e-12
+    Dn = D / row_scale
+    norms = np.linalg.norm(Dn, axis=1, keepdims=True) + 1e-12
+    return Dn / norms
+
+
+def compute_M_region_geom(
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    comm_A: np.ndarray,
+    comm_B: np.ndarray,
+    pi_comm: np.ndarray,
+    shape_power: float = 1.0,
+) -> np.ndarray:
+    """
+    Bidirectional mapped-region geometry consistency cost.
+
+    This term compares intrinsic *relative-position signatures* in both frames:
+      - Source cells transformed to target frame vs target cells (anchors: target communities)
+      - Target cells transformed to source frame vs source cells (anchors: source communities)
+
+    The final cost is the average cosine-distance mismatch across both frames.
+    Lower values indicate better preservation of overall mapped-region geometry.
+    """
+    pwr = float(max(1.0, shape_power))
+
+    unique_A = np.unique(comm_A)
+    unique_B = np.unique(comm_B)
+    if len(unique_A) == 0 or len(unique_B) == 0:
+        return np.zeros((coords_A.shape[0], coords_B.shape[0]), dtype=np.float64)
+
+    cent_A = np.vstack([coords_A[comm_A == c].mean(axis=0) for c in unique_A])
+    cent_B = np.vstack([coords_B[comm_B == c].mean(axis=0) for c in unique_B])
+
+    try:
+        R, t_src, t_tgt = _fit_weighted_rigid_transform(cent_A, cent_B, pi_comm)
+    except Exception:
+        R = np.eye(2, dtype=np.float64)
+        t_src = np.zeros(2, dtype=np.float64)
+        t_tgt = np.zeros(2, dtype=np.float64)
+
+    # Source represented in target frame.
+    coords_A_in_B = (R @ (coords_A - t_src).T).T + t_tgt
+    # Target represented in source frame.
+    coords_B_in_A = (R.T @ (coords_B - t_tgt).T).T + t_src
+
+    # Target-frame signatures.
+    feat_A_B = _normalised_distance_features(cdist(coords_A_in_B, cent_B))
+    feat_B_B = _normalised_distance_features(cdist(coords_B, cent_B))
+    M_B = cosine_distances(feat_A_B, feat_B_B)
+
+    # Source-frame signatures.
+    feat_A_A = _normalised_distance_features(cdist(coords_A, cent_A))
+    feat_B_A = _normalised_distance_features(cdist(coords_B_in_A, cent_A))
+    M_A = cosine_distances(feat_A_A, feat_B_A)
+
+    # Cosine distance is in [0, 2]. Re-scale to [0, 1] for stable fusion.
+    M = 0.5 * (M_A + M_B)
+    M = np.clip(M / 2.0, 0.0, 1.0)
     if pwr > 1.0:
         M = M ** pwr
     return M.astype(np.float64)

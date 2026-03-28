@@ -15,7 +15,9 @@ from __future__ import annotations
 import time
 import numpy as np
 import scipy.sparse as sp
+import scipy.sparse.csgraph as csgraph
 from anndata import AnnData
+from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import cosine_distances
 from typing import Optional, Tuple
 
@@ -26,8 +28,10 @@ from .costs import (
     compute_M_neighborhood,
     compute_M_topo,
     compute_M_boundary,
+    compute_M_shape_context,
     compute_M_anchor,
     compute_M_compact,
+    compute_M_region_geom,
     fuse_costs,
 )
 from .solver import estimate_overlap_fraction, calibrate_rho, solve_ufgw, _norm_dist
@@ -49,6 +53,72 @@ def _compute_objectives(
     return obj_neighbor, obj_gene_cos
 
 
+def _graph_geodesic_dist(
+    coords: np.ndarray,
+    adj: sp.csr_matrix,
+) -> Tuple[np.ndarray, float]:
+    """
+    Weighted graph geodesic distances using spatial edge lengths.
+
+    Falls back to Euclidean distances if geodesics are ill-defined.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    D_euc = _norm_dist(cdist(coords, coords))
+
+    if adj is None:
+        return D_euc, 1.0
+
+    adj_csr = sp.csr_matrix(adj)
+    if adj_csr.nnz == 0:
+        return D_euc, 1.0
+
+    upper = sp.triu(adj_csr, k=1).tocoo()
+    if upper.nnz == 0:
+        return D_euc, 1.0
+
+    edge_w = np.linalg.norm(coords[upper.row] - coords[upper.col], axis=1)
+    W = sp.coo_matrix((edge_w, (upper.row, upper.col)), shape=adj_csr.shape).tocsr()
+    W = W + W.T
+
+    D_geo = csgraph.shortest_path(W, directed=False, unweighted=False)
+    finite = np.isfinite(D_geo)
+    if not np.any(finite):
+        return D_euc, 1.0
+
+    # Normalise finite geodesics and use Euclidean fallback across components.
+    max_f = float(np.max(D_geo[finite]))
+    D_geo = np.asarray(D_geo, dtype=np.float64) / (max_f + 1e-12)
+    D_geo = np.where(finite, D_geo, D_euc)
+    disconnected_frac = 1.0 - float(np.mean(finite))
+    return _norm_dist(D_geo), disconnected_frac
+
+
+def _build_geometry_matrix(
+    coords: np.ndarray,
+    adj: sp.csr_matrix,
+    geodesic_weight: float,
+    geodesic_max_cells: int,
+) -> np.ndarray:
+    """
+    Blend Euclidean and graph-geodesic distances for GW geometry.
+
+    A positive geodesic weight improves intrinsic shape preservation under
+    slight nonrigid deformations while keeping rigid-transform compatibility.
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    D_euc = _norm_dist(cdist(coords, coords))
+
+    w = float(np.clip(geodesic_weight, 0.0, 1.0))
+    if w <= 0.0 or coords.shape[0] > int(max(50, geodesic_max_cells)):
+        return D_euc
+
+    D_geo, disconnected_frac = _graph_geodesic_dist(coords, adj)
+
+    # If many node pairs are disconnected, rely more on Euclidean geometry.
+    w_eff = w * max(0.0, 1.0 - disconnected_frac)
+    return ((1.0 - w_eff) * D_euc + w_eff * D_geo).astype(np.float64)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,6 +135,11 @@ def pairwise_align_stfa(
     k_max: int = 30,
     compactness_weight: float = 1.0,
     compactness_quantile: float = 0.90,
+    region_geometry_weight: float = 1.0,
+    shape_context_weight: float = 1.25,
+    shape_k_neighbors: int = 24,
+    geodesic_geometry_weight: float = 0.35,
+    geodesic_max_cells: int = 2500,
     confidence_power: float = 1.30,
     confidence_rounds: int = 1,
     verbose: bool = False,
@@ -88,6 +163,11 @@ def pairwise_align_stfa(
     k_min/max : adaptive k-NN graph search range
     compactness_weight   : weight of compactness cost in fused linear term
     compactness_quantile : robust scaling quantile for compactness distances
+    region_geometry_weight : weight of bidirectional region-geometry cost
+    shape_context_weight : weight of local shape-context cost
+    shape_k_neighbors    : neighborhood size for local shape-context descriptor
+    geodesic_geometry_weight : blend weight for graph geodesic in GW geometry
+    geodesic_max_cells   : skip geodesic all-pairs above this cell count
     confidence_power     : >1 sharpens row/column conditionals (one-to-few)
     confidence_rounds    : alternating row/column sharpening rounds
     verbose   : print solver progress
@@ -150,12 +230,17 @@ def pairwise_align_stfa(
 
     # ── 3. Assemble fused cost ────────────────────────────────────────────────
     if verbose:
-        print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor, compactness) ...")
+        print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor, compactness, region-geometry, shape-context) ...")
     M_gene         = compute_M_gene(sA, sB, use_rep=use_rep)
     M_celltype     = compute_M_celltype(sA, sB)
     M_neighborhood = compute_M_neighborhood(sA, sB, radius=radius)
     M_topo         = compute_M_topo(H_A, H_B)
     M_boundary     = compute_M_boundary(adj_A, adj_B)
+    M_shape        = compute_M_shape_context(
+        coords_A,
+        coords_B,
+        k_neighbors=shape_k_neighbors,
+    )
     M_compact      = compute_M_compact(
         coords_A,
         coords_B,
@@ -163,6 +248,13 @@ def pairwise_align_stfa(
         comm_B,
         pi_comm,
         quantile=compactness_quantile,
+    )
+    M_region_geom  = compute_M_region_geom(
+        coords_A,
+        coords_B,
+        comm_A,
+        comm_B,
+        pi_comm,
     )
 
     M_fused        = fuse_costs(
@@ -173,13 +265,34 @@ def pairwise_align_stfa(
         M_boundary,
         M_anchor,
         M_compact,
-        weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, float(max(0.0, compactness_weight))],
+        M_region_geom,
+        M_shape,
+        weights=[
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            float(max(0.0, compactness_weight)),
+            float(max(0.0, region_geometry_weight)),
+            float(max(0.0, shape_context_weight)),
+        ],
     )
 
     # ── 4. Geometry matrices ──────────────────────────────────────────────────
-    from scipy.spatial.distance import cdist
-    C_A = _norm_dist(cdist(coords_A, coords_A))
-    C_B = _norm_dist(cdist(coords_B, coords_B))
+    C_A = _build_geometry_matrix(
+        coords_A,
+        adj_A,
+        geodesic_weight=geodesic_geometry_weight,
+        geodesic_max_cells=geodesic_max_cells,
+    )
+    C_B = _build_geometry_matrix(
+        coords_B,
+        adj_B,
+        geodesic_weight=geodesic_geometry_weight,
+        geodesic_max_cells=geodesic_max_cells,
+    )
 
     # ── 5. Calibrate rho and gamma ────────────────────────────────────────────
     f_ovlp = estimate_overlap_fraction(coords_A, coords_B)
