@@ -212,34 +212,39 @@ def pairwise_align_stfa(
     k_max: int = 30,
     gene_weight: float = 0.8,
     celltype_weight: float = 6.0,
-    neighborhood_weight: float = 3.0,
+    neighborhood_weight: float = 4.0,
     topology_weight: float = 0.0,
     boundary_weight: float = 0.0,
-    anchor_weight: float = 0.25,
+    anchor_weight: float = 0.35,
     anchor_spatial_blend: float = 0.75,
     compactness_weight: float = 2.0,
     compactness_quantile: float = 0.80,
     compactness_power: float = 1.75,
     strict_celltype_gate: float = 3.0,
-    strict_compactness_gate: float = 1.0,
-    strict_compactness_quantile: float = 0.75,
+    strict_neighborhood_gate: float = 0.9,
+    strict_neighborhood_quantile: float = 0.65,
+    strict_compactness_gate: float = 0.8,
+    strict_compactness_quantile: float = 0.78,
     region_geometry_weight: float = 2.0,
     region_geometry_power: float = 1.25,
     shape_context_weight: float = 2.0,
     shape_context_power: float = 1.25,
     shape_k_neighbors: int = 24,
-    geodesic_geometry_weight: float = 0.20,
+    geodesic_geometry_weight: float = 0.25,
     geodesic_max_cells: int = 2500,
     rho_min: float = 0.05,
     rho_max: float = 20.0,
     rho_overlap_power: float = 1.5,
-    rho_scale: float = 0.80,
+    rho_scale: float = 1.60,
     overlap_rotation_samples: int = 24,
-    target_mass_fraction: Optional[float] = 0.90,
+    target_mass_fraction: Optional[float] = 0.95,
     rho_retry_factor: float = 1.8,
     rho_retry_rounds: int = 3,
-    confidence_power: float = 1.20,
-    confidence_rounds: int = 1,
+    confidence_power: float = 1.30,
+    confidence_rounds: int = 2,
+    support_row_ratio: float = 0.001,
+    support_col_ratio: float = 0.001,
+    support_min_mass: float = 0.0,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, float, float, float, float]:
     """
@@ -255,7 +260,7 @@ def pairwise_align_stfa(
           - ``.obs['cell_type_annot']`` categorical cell-type labels
     radius    : neighbourhood radius for JSD computation (same units as coords)
     use_rep   : if not None, use ``sliceA.obsm[use_rep]`` for gene cost instead of .X
-    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.30.
+    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.35.
     n_iter    : max UFGW conditional-gradient iterations
     eps       : entropic regularisation for mm_unbalanced
     k_min/max : adaptive k-NN graph search range
@@ -269,6 +274,10 @@ def pairwise_align_stfa(
     compactness_power    : >1 sharpens compactness penalties
     strict_celltype_gate : additional unnormalised penalty on cell-type
         mismatched pairs (strongly enforces type-consistent transport)
+    strict_neighborhood_gate : additional unnormalised penalty on poor
+        neighborhood-compatibility pairs (promotes NSP preservation)
+    strict_neighborhood_quantile : row-wise quantile threshold on
+        M_neighborhood used to define poor neighborhood pairs
     strict_compactness_gate : additional unnormalised penalty on long-range
         compactness violations
     strict_compactness_quantile : quantile threshold on M_compact used to
@@ -289,6 +298,11 @@ def pairwise_align_stfa(
     rho_retry_rounds     : number of retries for target_mass_fraction
     confidence_power     : >1 sharpens row/column conditionals (one-to-few)
     confidence_rounds    : alternating row/column sharpening rounds
+    support_row_ratio    : prune entries below row-wise max ratio after
+        confidence sharpening
+    support_col_ratio    : prune entries below column-wise max ratio after
+        confidence sharpening
+    support_min_mass     : absolute floor pruning after confidence sharpening
     verbose   : print solver progress
 
     Returns
@@ -434,9 +448,15 @@ def pairwise_align_stfa(
     if strict_celltype_gate > 0 and celltype_weight > 0:
         M_fused = M_fused + float(strict_celltype_gate) * M_celltype
 
+    if strict_neighborhood_gate > 0 and neighborhood_weight > 0:
+        q_nei = float(np.clip(strict_neighborhood_quantile, 0.50, 0.99))
+        cut_n = np.quantile(M_neighborhood, q_nei, axis=1, keepdims=True)
+        neigh_hard = (M_neighborhood > cut_n).astype(np.float64)
+        M_fused = M_fused + float(strict_neighborhood_gate) * neigh_hard
+
     if strict_compactness_gate > 0:
         q_gate = float(np.clip(strict_compactness_quantile, 0.50, 0.99))
-        cut = float(np.quantile(M_compact, q_gate))
+        cut = np.quantile(M_compact, q_gate, axis=1, keepdims=True)
         compact_hard = (M_compact > cut).astype(np.float64)
         M_fused = M_fused + float(strict_compactness_gate) * compact_hard
 
@@ -468,7 +488,7 @@ def pairwise_align_stfa(
         rho_scale=rho_scale,
     )
     if gamma is None:
-        gamma = 0.30
+        gamma = 0.35
     p_A = np.ones(N_A) / N_A
     p_B = np.ones(N_B) / N_B
 
@@ -498,6 +518,9 @@ def pairwise_align_stfa(
         n_iter=n_iter,
         confidence_power=confidence_power,
         confidence_rounds=confidence_rounds,
+        support_row_ratio=support_row_ratio,
+        support_col_ratio=support_col_ratio,
+        support_min_mass=support_min_mass,
         verbose=verbose,
     )
 
@@ -526,6 +549,9 @@ def pairwise_align_stfa(
                 n_iter=n_iter,
                 confidence_power=confidence_power,
                 confidence_rounds=confidence_rounds,
+                support_row_ratio=support_row_ratio,
+                support_col_ratio=support_col_ratio,
+                support_min_mass=support_min_mass,
                 verbose=False,
             )
             mass_try = float(pi_try.sum())

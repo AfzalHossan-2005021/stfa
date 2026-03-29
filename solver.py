@@ -149,6 +149,9 @@ def _bidir_power_sharpen(
     pi: np.ndarray,
     power: float = 1.0,
     rounds: int = 1,
+    support_row_ratio: float = 0.0,
+    support_col_ratio: float = 0.0,
+    support_min_mass: float = 0.0,
 ) -> np.ndarray:
     """
     Sharpen transport conditionals in both directions.
@@ -158,27 +161,51 @@ def _bidir_power_sharpen(
     """
     pwr = float(power)
     n_rounds = int(rounds)
-    if pwr <= 1.0 or n_rounds <= 0:
+    row_ratio = float(max(0.0, support_row_ratio))
+    col_ratio = float(max(0.0, support_col_ratio))
+    min_mass = float(max(0.0, support_min_mass))
+
+    if pwr <= 1.0 and n_rounds <= 0 and row_ratio <= 0 and col_ratio <= 0 and min_mass <= 0:
         return np.asarray(pi, dtype=np.float64)
 
     out = np.clip(np.asarray(pi, dtype=np.float64), 0.0, None)
 
-    for _ in range(n_rounds):
+    rounds_eff = max(1, n_rounds) if pwr > 1.0 else max(1, n_rounds)
+
+    for _ in range(rounds_eff):
         # Row-wise sharpening: one source -> fewer targets.
-        row_mass = out.sum(axis=1, keepdims=True)
-        nz_row = row_mass[:, 0] > 0
-        if np.any(nz_row):
-            row_sharp = np.power(out[nz_row, :], pwr)
-            row_sharp /= row_sharp.sum(axis=1, keepdims=True) + 1e-12
-            out[nz_row, :] = row_sharp * row_mass[nz_row, :]
+        if pwr > 1.0:
+            row_mass = out.sum(axis=1, keepdims=True)
+            nz_row = row_mass[:, 0] > 0
+            if np.any(nz_row):
+                row_sharp = np.power(out[nz_row, :], pwr)
+                row_sharp /= row_sharp.sum(axis=1, keepdims=True) + 1e-12
+                out[nz_row, :] = row_sharp * row_mass[nz_row, :]
 
         # Column-wise sharpening: one target <- fewer sources.
-        col_mass = out.sum(axis=0, keepdims=True)
-        nz_col = col_mass[0, :] > 0
-        if np.any(nz_col):
-            col_sharp = np.power(out[:, nz_col], pwr)
-            col_sharp /= col_sharp.sum(axis=0, keepdims=True) + 1e-12
-            out[:, nz_col] = col_sharp * col_mass[:, nz_col]
+        if pwr > 1.0:
+            col_mass = out.sum(axis=0, keepdims=True)
+            nz_col = col_mass[0, :] > 0
+            if np.any(nz_col):
+                col_sharp = np.power(out[:, nz_col], pwr)
+                col_sharp /= col_sharp.sum(axis=0, keepdims=True) + 1e-12
+                out[:, nz_col] = col_sharp * col_mass[:, nz_col]
+
+        if row_ratio > 0.0 or col_ratio > 0.0 or min_mass > 0.0:
+            mass_before = float(out.sum())
+            if mass_before > 0.0:
+                if row_ratio > 0.0:
+                    row_max = out.max(axis=1, keepdims=True)
+                    out = out * (out >= (row_ratio * (row_max + 1e-12)))
+                if col_ratio > 0.0:
+                    col_max = out.max(axis=0, keepdims=True)
+                    out = out * (out >= (col_ratio * (col_max + 1e-12)))
+                if min_mass > 0.0:
+                    out[out < min_mass] = 0.0
+
+                mass_after = float(out.sum())
+                if mass_after > 0.0:
+                    out *= mass_before / (mass_after + 1e-12)
 
     return out
 
@@ -200,6 +227,9 @@ def solve_ufgw(
     tol: float = 1e-7,
     confidence_power: float = 1.0,
     confidence_rounds: int = 1,
+    support_row_ratio: float = 0.0,
+    support_col_ratio: float = 0.0,
+    support_min_mass: float = 0.0,
     verbose: bool = False,
 ) -> np.ndarray:
     """
@@ -228,6 +258,9 @@ def solve_ufgw(
     tol       : convergence threshold on |Δcost|/|cost|
     confidence_power  : >1 sharpens couplings toward one-to-few correspondences
     confidence_rounds : alternating row/column sharpening rounds per OT step
+    support_row_ratio : prune entries below row-wise max ratio after sharpening
+    support_col_ratio : prune entries below column-wise max ratio after sharpening
+    support_min_mass  : absolute floor pruning after sharpening
 
     Returns
     -------
@@ -292,6 +325,9 @@ def solve_ufgw(
             pi_new,
             power=confidence_power,
             rounds=confidence_rounds,
+            support_row_ratio=support_row_ratio,
+            support_col_ratio=support_col_ratio,
+            support_min_mass=support_min_mass,
         )
 
     # ── Helper: total cost ────────────────────────────────────────────────────
@@ -340,4 +376,7 @@ def solve_ufgw(
         pi,
         power=confidence_power,
         rounds=confidence_rounds,
+        support_row_ratio=support_row_ratio,
+        support_col_ratio=support_col_ratio,
+        support_min_mass=support_min_mass,
     )

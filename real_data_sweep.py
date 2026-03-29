@@ -48,45 +48,56 @@ def _validate_slice_fields(slice_obj: ad.AnnData, name: str) -> None:
 def _base_config() -> Dict[str, Any]:
     return {
         "celltype_weight": 6.0,
-        "neighborhood_weight": 3.0,
+        "neighborhood_weight": 4.0,
         "topology_weight": 0.0,
         "boundary_weight": 0.0,
-        "anchor_weight": 0.25,
+        "anchor_weight": 0.35,
         "anchor_spatial_blend": 0.75,
         "compactness_weight": 2.0,
         "compactness_quantile": 0.80,
         "compactness_power": 1.75,
         "strict_celltype_gate": 3.0,
-        "strict_compactness_gate": 1.0,
-        "strict_compactness_quantile": 0.75,
+        "strict_neighborhood_gate": 0.9,
+        "strict_neighborhood_quantile": 0.65,
+        "strict_compactness_gate": 0.8,
+        "strict_compactness_quantile": 0.78,
         "region_geometry_weight": 2.0,
         "region_geometry_power": 1.25,
         "shape_context_weight": 2.0,
         "shape_context_power": 1.25,
-        "geodesic_geometry_weight": 0.20,
-        "rho_scale": 0.80,
-        "target_mass_fraction": 0.90,
+        "geodesic_geometry_weight": 0.25,
+        "rho_scale": 1.60,
+        "target_mass_fraction": 0.95,
         "rho_retry_factor": 1.8,
         "rho_retry_rounds": 3,
-        "confidence_power": 1.20,
-        "gamma": 0.30,
+        "confidence_power": 1.30,
+        "confidence_rounds": 2,
+        "support_row_ratio": 0.001,
+        "support_col_ratio": 0.001,
+        "support_min_mass": 0.0,
+        "gamma": 0.35,
     }
 
 
 def _build_trial_configs(max_trials: int, seed: int) -> List[Dict[str, Any]]:
     base = _base_config()
     search_axes = {
-        "strict_celltype_gate": [2.5, 3.0, 4.0],
-        "strict_compactness_gate": [0.75, 1.0, 1.25],
-        "neighborhood_weight": [2.5, 3.0, 4.0],
-        "rho_scale": [0.70, 0.80, 1.00],
+        "strict_compactness_gate": [0.6, 0.8, 1.2],
+        "strict_neighborhood_gate": [0.7, 0.9, 1.2],
+        "gamma": [0.32, 0.35, 0.40],
+        "rho_scale": [1.2, 1.6, 2.0],
+        "support_ratio": [0.0, 0.001, 0.003],
     }
 
     keys = list(search_axes.keys())
     all_cfgs: List[Dict[str, Any]] = []
     for values in itertools.product(*(search_axes[k] for k in keys)):
         cfg = dict(base)
-        cfg.update({k: v for k, v in zip(keys, values)})
+        update = {k: v for k, v in zip(keys, values)}
+        support_ratio = float(update.pop("support_ratio"))
+        cfg.update(update)
+        cfg["support_row_ratio"] = support_ratio
+        cfg["support_col_ratio"] = support_ratio
         all_cfgs.append(cfg)
 
     if max_trials <= 0 or max_trials >= len(all_cfgs):
