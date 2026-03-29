@@ -18,7 +18,6 @@ import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 from anndata import AnnData
 from scipy.spatial.distance import cdist
-from sklearn.metrics.pairwise import cosine_distances
 from typing import Optional, Tuple
 
 from .graph import build_knn_graph, compute_diffusion_signatures, detect_communities
@@ -130,16 +129,30 @@ def pairwise_align_stfa(
     use_rep: Optional[str] = None,
     gamma: Optional[float] = None,
     n_iter: int = 200,
-    eps: float = 0.05,
+    eps: float = 0.0,
     k_min: int = 10,
     k_max: int = 30,
-    compactness_weight: float = 1.0,
+    gene_weight: float = 0.8,
+    celltype_weight: float = 4.0,
+    neighborhood_weight: float = 4.0,
+    topology_weight: float = 0.8,
+    boundary_weight: float = 1.0,
+    anchor_weight: float = 1.0,
+    compactness_weight: float = 1.25,
     compactness_quantile: float = 0.90,
-    region_geometry_weight: float = 1.0,
-    shape_context_weight: float = 1.25,
+    region_geometry_weight: float = 1.25,
+    shape_context_weight: float = 1.50,
     shape_k_neighbors: int = 24,
     geodesic_geometry_weight: float = 0.35,
     geodesic_max_cells: int = 2500,
+    rho_min: float = 0.05,
+    rho_max: float = 20.0,
+    rho_overlap_power: float = 1.5,
+    rho_scale: float = 0.35,
+    overlap_rotation_samples: int = 24,
+    target_mass_fraction: Optional[float] = None,
+    rho_retry_factor: float = 2.0,
+    rho_retry_rounds: int = 2,
     confidence_power: float = 1.30,
     confidence_rounds: int = 1,
     verbose: bool = False,
@@ -157,10 +170,13 @@ def pairwise_align_stfa(
           - ``.obs['cell_type_annot']`` categorical cell-type labels
     radius    : neighbourhood radius for JSD computation (same units as coords)
     use_rep   : if not None, use ``sliceA.obsm[use_rep]`` for gene cost instead of .X
-    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.5.
+    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.35.
     n_iter    : max UFGW conditional-gradient iterations
     eps       : entropic regularisation for mm_unbalanced
     k_min/max : adaptive k-NN graph search range
+    gene_weight, celltype_weight, neighborhood_weight, topology_weight,
+    boundary_weight, anchor_weight : weights for core biological/topological
+        costs in the fused linear objective
     compactness_weight   : weight of compactness cost in fused linear term
     compactness_quantile : robust scaling quantile for compactness distances
     region_geometry_weight : weight of bidirectional region-geometry cost
@@ -168,6 +184,13 @@ def pairwise_align_stfa(
     shape_k_neighbors    : neighborhood size for local shape-context descriptor
     geodesic_geometry_weight : blend weight for graph geodesic in GW geometry
     geodesic_max_cells   : skip geodesic all-pairs above this cell count
+    rho_min/rho_max      : lower/upper bounds for KL mass penalty calibration
+    rho_overlap_power    : overlap-to-rho nonlinearity (>1 tightens high-overlap)
+    rho_scale            : global multiplier for calibrated rho
+    overlap_rotation_samples : number of global rotations tested for overlap
+    target_mass_fraction : optional minimum desired transported mass in [0, 1]
+    rho_retry_factor     : multiplicative rho increase per retry if mass is low
+    rho_retry_rounds     : number of retries for target_mass_fraction
     confidence_power     : >1 sharpens row/column conditionals (one-to-few)
     confidence_rounds    : alternating row/column sharpening rounds
     verbose   : print solver progress
@@ -268,12 +291,12 @@ def pairwise_align_stfa(
         M_region_geom,
         M_shape,
         weights=[
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
+            float(max(0.0, gene_weight)),
+            float(max(0.0, celltype_weight)),
+            float(max(0.0, neighborhood_weight)),
+            float(max(0.0, topology_weight)),
+            float(max(0.0, boundary_weight)),
+            float(max(0.0, anchor_weight)),
             float(max(0.0, compactness_weight)),
             float(max(0.0, region_geometry_weight)),
             float(max(0.0, shape_context_weight)),
@@ -295,10 +318,20 @@ def pairwise_align_stfa(
     )
 
     # ── 5. Calibrate rho and gamma ────────────────────────────────────────────
-    f_ovlp = estimate_overlap_fraction(coords_A, coords_B)
-    rho    = calibrate_rho(f_ovlp)
+    f_ovlp = estimate_overlap_fraction(
+        coords_A,
+        coords_B,
+        n_rotations=overlap_rotation_samples,
+    )
+    rho = calibrate_rho(
+        f_ovlp,
+        rho_min=rho_min,
+        rho_max=rho_max,
+        overlap_power=rho_overlap_power,
+        rho_scale=rho_scale,
+    )
     if gamma is None:
-        gamma = 0.5
+        gamma = 0.35
     p_A = np.ones(N_A) / N_A
     p_B = np.ones(N_B) / N_B
 
@@ -330,6 +363,42 @@ def pairwise_align_stfa(
         confidence_rounds=confidence_rounds,
         verbose=verbose,
     )
+
+    if target_mass_fraction is not None:
+        target = float(np.clip(target_mass_fraction, 0.0, 1.0))
+        best_pi = np.asarray(pi12, dtype=np.float64)
+        best_mass = float(best_pi.sum())
+        rho_cur = float(rho)
+        retries = int(max(0, rho_retry_rounds))
+        rho_mult = float(max(1.1, rho_retry_factor))
+
+        for rr in range(retries):
+            if best_mass >= target or rho_cur >= rho_max - 1e-12:
+                break
+
+            rho_cur = min(float(rho_max), rho_cur * rho_mult)
+            if verbose:
+                print(
+                    f"  [STFA] mass retry {rr + 1}/{retries}: "
+                    f"ρ={rho_cur:.4f}, current_mass={best_mass:.4f}, target={target:.4f}"
+                )
+
+            pi_try = solve_ufgw(
+                p_A, p_B, M_fused, C_A, C_B,
+                rho=rho_cur, gamma=gamma, eps=eps,
+                n_iter=n_iter,
+                confidence_power=confidence_power,
+                confidence_rounds=confidence_rounds,
+                verbose=False,
+            )
+            mass_try = float(pi_try.sum())
+            if mass_try > best_mass:
+                best_mass = mass_try
+                best_pi = np.asarray(pi_try, dtype=np.float64)
+
+        pi12 = best_pi
+        if verbose:
+            print(f"  [STFA] final transported mass: {float(pi12.sum()):.4f}")
 
     # ── 8. Final objectives ───────────────────────────────────────────────────
     # Normalise pi12 so it sums to 1 (probability plan for metric computation)

@@ -5,7 +5,7 @@ Unbalanced Fused Gromov-Wasserstein solver.
 
 Key ideas vs. old balanced FGW:
   - KL-penalised marginals (ρ_A, ρ_B) let unmatched cells "die" naturally
-  - ρ is calibrated from convex-hull overlap fraction
+    - ρ is calibrated from transform-invariant convex-hull overlap fraction
   - Uses POT mm_unbalanced inside a simple conditional-gradient GW loop
   - Falls back to balanced emd if ot.unbalanced is unavailable
 """
@@ -30,15 +30,39 @@ def _hull_area(pts: np.ndarray) -> float:
         return 0.0
 
 
+def _canonicalise_coords(coords: np.ndarray) -> np.ndarray:
+    """
+    Canonicalise coordinates for transform-invariant overlap estimation.
+
+    Removes translation and global scale; rotation is handled separately by
+    scanning candidate angles in estimate_overlap_fraction.
+    """
+    pts = np.asarray(coords, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+
+    centered = pts - pts.mean(axis=0, keepdims=True)
+    norms = np.linalg.norm(centered, axis=1)
+    scale = float(np.median(norms))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = float(np.mean(norms) + 1e-12)
+    return centered / (scale + 1e-12)
+
+
 def estimate_overlap_fraction(
     coordsA: np.ndarray,
     coordsB: np.ndarray,
     n_mc: int = 5000,
     seed: int = 42,
+    n_rotations: int = 24,
 ) -> float:
     """
-    Monte-Carlo estimate of the convex-hull overlap fraction between two 2D
-    point clouds.
+    Transform-invariant Monte-Carlo estimate of convex-hull overlap fraction.
+
+    Both slices are first canonicalised for translation and global scale.
+    Then we scan a small set of global rotations for slice B and keep the
+    best overlap value. This avoids severely underestimating overlap when two
+    slices differ mostly by whole-slice translation/rotation.
 
     Returns
     -------
@@ -46,14 +70,19 @@ def estimate_overlap_fraction(
     """
     rng = np.random.default_rng(seed)
 
+    A = _canonicalise_coords(coordsA)
+    B = _canonicalise_coords(coordsB)
+    if A.shape[0] < 3 or B.shape[0] < 3:
+        return 0.5
+
     try:
-        hull_A = ConvexHull(coordsA)
+        hull_A = ConvexHull(A)
     except (QhullError, Exception):
         return 0.5    # degenerate: assume 50% overlap
 
     # Sample random points inside hull_A
-    lo = coordsA.min(axis=0)
-    hi = coordsA.max(axis=0)
+    lo = A.min(axis=0)
+    hi = A.max(axis=0)
     pts = rng.uniform(lo, hi, size=(n_mc, 2))
 
     # Keep only those inside hull_A (half-space test)
@@ -64,34 +93,59 @@ def estimate_overlap_fraction(
     if len(pts_A) == 0:
         return 0.5
 
-    # Test which of those are also inside hull_B
-    try:
-        hull_B = ConvexHull(coordsB)
-    except (QhullError, Exception):
+    # Test overlap across candidate global rotations for B.
+    n_rot = int(max(1, n_rotations))
+    thetas = np.linspace(0.0, 2.0 * np.pi, num=n_rot, endpoint=False)
+
+    best = 0.0
+    for th in thetas:
+        c = float(np.cos(th))
+        s = float(np.sin(th))
+        R = np.array([[c, -s], [s, c]], dtype=np.float64)
+        B_rot = (R @ B.T).T
+
+        try:
+            hull_B = ConvexHull(B_rot)
+        except (QhullError, Exception):
+            continue
+
+        B_mat = hull_B.equations[:, :2]
+        b_B = hull_B.equations[:, 2]
+        in_B = (pts_A @ B_mat.T + b_B <= 1e-10).all(axis=1)
+        frac = float(in_B.sum()) / len(pts_A)
+        if frac > best:
+            best = frac
+
+    if best <= 0.0:
         return 0.5
-
-    B_mat = hull_B.equations[:, :2]
-    b_B = hull_B.equations[:, 2]
-    in_B = (pts_A @ B_mat.T + b_B <= 1e-10).all(axis=1)
-
-    return float(in_B.sum()) / len(pts_A)
+    return float(np.clip(best, 0.0, 1.0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ρ calibration
 # ──────────────────────────────────────────────────────────────────────────────
 
-def calibrate_rho(f_ovlp: float, rho_min: float = 0.01, rho_max: float = 1.0) -> float:
+def calibrate_rho(
+    f_ovlp: float,
+    rho_min: float = 0.05,
+    rho_max: float = 20.0,
+    overlap_power: float = 1.5,
+    rho_scale: float = 1.0,
+) -> float:
     """
-    KL penalty parameter ρ from maximum-entropy estimate given known overlap.
+    Calibrate KL mass-penalty ρ from estimated overlap.
 
-    ρ = −f · log(f)   (peaked at f=1/e ≈ 0.37, zero at f=0 and f=1)
+    We use a monotone increasing schedule:
+      - high overlap -> larger ρ -> closer to balanced mass transport
+      - low overlap  -> smaller ρ -> allows more unmatched mass
 
-    When f≈1 (full overlap) ρ is small → nearly balanced (like PASTE).
-    When f≈0 (barely any overlap) ρ is small → very unbalanced (destroy all mass).
+    The scale factor rho_scale lets users globally tighten/relax mass matching
+    without changing overlap estimation.
     """
-    f = float(np.clip(f_ovlp, 1e-6, 1 - 1e-6))
-    rho = -f * np.log(f)
+    f = float(np.clip(f_ovlp, 0.0, 1.0))
+    p = float(max(0.5, overlap_power))
+    rho = float(rho_min + (rho_max - rho_min) * (f ** p))
+    rho = float(max(0.0, rho_scale)) * rho
     return float(np.clip(rho, rho_min, rho_max))
 
 
@@ -235,6 +289,7 @@ def solve_ufgw(
             pi_new = ot.unbalanced.mm_unbalanced(
                 p_A, p_B, M_pos,
                 reg_m=(rho, rho),
+                reg=eps,
                 div='kl',
                 numItermax=500,
                 stopThr=1e-8,
