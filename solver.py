@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def _canonicalise_coords(coords: np.ndarray) -> np.ndarray:
@@ -218,8 +218,8 @@ def solve_ufgw(
     p_A: np.ndarray,
     p_B: np.ndarray,
     M_fused: np.ndarray,
-    C_A: np.ndarray,
-    C_B: np.ndarray,
+    C_A: Optional[np.ndarray],
+    C_B: Optional[np.ndarray],
     rho: float,
     gamma: float = 0.5,
     eps: float = 0.05,
@@ -251,6 +251,7 @@ def solve_ufgw(
     p_A, p_B  : marginal priors (uniform 1/N)
     M_fused   : (N_A, N_B) fused linear cost
     C_A, C_B  : (N_A, N_A), (N_B, N_B) spatial distance matrices (normalised)
+                or None when running memory-safe linear UOT fallback
     rho       : KL penalty for both marginals
     gamma     : balance between feature cost (0) and geometry (1)
     eps       : entropic regularisation for mm_unbalanced (smoother gradients)
@@ -270,9 +271,12 @@ def solve_ufgw(
 
     N_A, N_B = M_fused.shape
 
-    # Pre-compute for square-loss GW terms.
-    C_A_sq = C_A * C_A
-    C_B_sq = C_B * C_B
+    use_gw = (gamma > 1e-12) and (C_A is not None) and (C_B is not None)
+    if use_gw:
+        C_A_sq = C_A * C_A
+        C_B_sq = C_B * C_B
+    else:
+        gamma = 0.0
 
     # ── Initialise with outer product (independent coupling) ─────────────────
     pi = np.outer(p_A, p_B)
@@ -285,6 +289,9 @@ def solve_ufgw(
         GW(π) = <C_A^2, r r^T> + <C_B^2, c c^T> - 2 <C_A π C_B, π>
         where r = π1 and c = π^T1.
         """
+        if not use_gw:
+            return np.zeros_like(pi_cur)
+
         row = pi_cur.sum(axis=1)  # r
         col = pi_cur.sum(axis=0)  # c
 
@@ -295,6 +302,8 @@ def solve_ufgw(
 
     # ── Helper: scalar GW cost ────────────────────────────────────────────────
     def _gw_cost(pi_cur: np.ndarray) -> float:
+        if not use_gw:
+            return 0.0
         row = pi_cur.sum(axis=1)
         col = pi_cur.sum(axis=0)
         term_a = float(row @ (C_A_sq @ row))
@@ -320,15 +329,7 @@ def solve_ufgw(
                 pi_new = ot.emd(p_A, p_B, M_pos)
             except Exception:
                 pi_new = np.outer(p_A, p_B)
-        pi_new = np.asarray(pi_new, dtype=np.float64)
-        return _bidir_power_sharpen(
-            pi_new,
-            power=confidence_power,
-            rounds=confidence_rounds,
-            support_row_ratio=support_row_ratio,
-            support_col_ratio=support_col_ratio,
-            support_min_mass=support_min_mass,
-        )
+        return np.asarray(pi_new, dtype=np.float64)
 
     # ── Helper: total cost ────────────────────────────────────────────────────
     def _total_cost(pi_cur: np.ndarray) -> float:
@@ -340,6 +341,18 @@ def solve_ufgw(
         kl_B = float(np.sum(col * np.log((col + 1e-12) / (p_B + 1e-12)) - col + p_B))
         return linear + gw + rho * kl_A + rho * kl_B
 
+    # Linear UOT shortcut when GW is disabled.
+    if not use_gw:
+        pi_lin = _ot_step(M_fused)
+        return _bidir_power_sharpen(
+            pi_lin,
+            power=confidence_power,
+            rounds=confidence_rounds,
+            support_row_ratio=support_row_ratio,
+            support_col_ratio=support_col_ratio,
+            support_min_mass=support_min_mass,
+        )
+
     # ── Conditional gradient loop ─────────────────────────────────────────────
     prev_cost = _total_cost(pi)
     for it in range(n_iter):
@@ -347,7 +360,14 @@ def solve_ufgw(
         M_lin = (1.0 - gamma) * M_fused + gamma * _gw_grad(pi)
 
         # Frank-Wolfe direction
-        pi_fw = _ot_step(M_lin)
+        pi_fw = _bidir_power_sharpen(
+            _ot_step(M_lin),
+            power=confidence_power,
+            rounds=confidence_rounds,
+            support_row_ratio=support_row_ratio,
+            support_col_ratio=support_col_ratio,
+            support_min_mass=support_min_mass,
+        )
 
         # Armijo line search  α ∈ [0, 1]
         delta = pi_fw - pi

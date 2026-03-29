@@ -245,6 +245,8 @@ def pairwise_align_stfa(
     support_row_ratio: float = 0.001,
     support_col_ratio: float = 0.001,
     support_min_mass: float = 0.0,
+    memory_safe_auto: bool = True,
+    memory_pair_limit: int = 80_000_000,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, float, float, float, float]:
     """
@@ -303,6 +305,9 @@ def pairwise_align_stfa(
     support_col_ratio    : prune entries below column-wise max ratio after
         confidence sharpening
     support_min_mass     : absolute floor pruning after confidence sharpening
+    memory_safe_auto     : automatically disable GW term when N_A*N_B is very
+        large to prevent out-of-memory crashes
+    memory_pair_limit    : pair-count threshold used by memory_safe_auto
     verbose   : print solver progress
 
     Returns
@@ -324,6 +329,18 @@ def pairwise_align_stfa(
 
     N_A = sA.n_obs
     N_B = sB.n_obs
+
+    if gamma is None:
+        gamma_req = 0.35
+    else:
+        gamma_req = float(np.clip(gamma, 0.0, 1.0))
+
+    pair_count = int(N_A) * int(N_B)
+    disable_gw = bool(
+        memory_safe_auto
+        and pair_count > int(memory_pair_limit)
+        and gamma_req > 0.0
+    )
 
     cell_types_A = np.asarray(sA.obs['cell_type_annot'].values)
     cell_types_B = np.asarray(sB.obs['cell_type_annot'].values)
@@ -460,19 +477,28 @@ def pairwise_align_stfa(
         compact_hard = (M_compact > cut).astype(np.float64)
         M_fused = M_fused + float(strict_compactness_gate) * compact_hard
 
-    # ── 4. Geometry matrices ──────────────────────────────────────────────────
-    C_A = _build_geometry_matrix(
-        coords_A,
-        adj_A,
-        geodesic_weight=geodesic_geometry_weight,
-        geodesic_max_cells=geodesic_max_cells,
-    )
-    C_B = _build_geometry_matrix(
-        coords_B,
-        adj_B,
-        geodesic_weight=geodesic_geometry_weight,
-        geodesic_max_cells=geodesic_max_cells,
-    )
+    # ── 4. Geometry matrices (optional in memory-safe mode) ─────────────────
+    if disable_gw or gamma_req <= 1e-12:
+        C_A = None
+        C_B = None
+        if verbose and disable_gw:
+            print(
+                "[STFA] Memory-safe mode: disabling GW geometry "
+                f"for pair_count={pair_count:,} (> {int(memory_pair_limit):,})."
+            )
+    else:
+        C_A = _build_geometry_matrix(
+            coords_A,
+            adj_A,
+            geodesic_weight=geodesic_geometry_weight,
+            geodesic_max_cells=geodesic_max_cells,
+        )
+        C_B = _build_geometry_matrix(
+            coords_B,
+            adj_B,
+            geodesic_weight=geodesic_geometry_weight,
+            geodesic_max_cells=geodesic_max_cells,
+        )
 
     # ── 5. Calibrate rho and gamma ────────────────────────────────────────────
     f_ovlp = estimate_overlap_fraction(
@@ -487,8 +513,7 @@ def pairwise_align_stfa(
         overlap_power=rho_overlap_power,
         rho_scale=rho_scale,
     )
-    if gamma is None:
-        gamma = 0.35
+    gamma = 0.0 if disable_gw else gamma_req
     p_A = np.ones(N_A) / N_A
     p_B = np.ones(N_B) / N_B
 
