@@ -118,6 +118,84 @@ def _build_geometry_matrix(
     return ((1.0 - w_eff) * D_euc + w_eff * D_geo).astype(np.float64)
 
 
+def _community_centroids(
+    coords: np.ndarray,
+    comm_labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return sorted unique community ids and their centroids."""
+    labels = np.asarray(comm_labels)
+    unique = np.unique(labels)
+    if unique.size == 0:
+        return unique, np.zeros((0, 2), dtype=np.float64)
+    centroids = np.vstack([coords[labels == c].mean(axis=0) for c in unique])
+    return unique, np.asarray(centroids, dtype=np.float64)
+
+
+def _spatial_community_coupling(
+    coords_A: np.ndarray,
+    coords_B: np.ndarray,
+    comm_A: np.ndarray,
+    comm_B: np.ndarray,
+) -> np.ndarray:
+    """
+    Build a community coupling from spatial centroids only.
+
+    This is used as a robust fallback/blend when descriptor-only community
+    matching is unstable.
+    """
+    _, cent_A = _community_centroids(np.asarray(coords_A, dtype=np.float64), comm_A)
+    _, cent_B = _community_centroids(np.asarray(coords_B, dtype=np.float64), comm_B)
+
+    n_cA = int(cent_A.shape[0])
+    n_cB = int(cent_B.shape[0])
+    if n_cA == 0 or n_cB == 0:
+        return np.zeros((n_cA, n_cB), dtype=np.float64)
+
+    # Canonicalise centroids to reduce global translation/scale sensitivity.
+    A0 = cent_A - cent_A.mean(axis=0, keepdims=True)
+    B0 = cent_B - cent_B.mean(axis=0, keepdims=True)
+    sA = float(np.median(np.linalg.norm(A0, axis=1))) + 1e-12
+    sB = float(np.median(np.linalg.norm(B0, axis=1))) + 1e-12
+    A0 = A0 / sA
+    B0 = B0 / sB
+
+    D = cdist(A0, B0)
+    q = float(np.quantile(D, 0.90))
+    if np.isfinite(q) and q > 0:
+        D = D / (q + 1e-12)
+
+    pA = np.ones(n_cA, dtype=np.float64) / n_cA
+    pB = np.ones(n_cB, dtype=np.float64) / n_cB
+
+    try:
+        import ot
+        pi = ot.emd(pA, pB, D)
+    except Exception:
+        pi = np.outer(pA, pB)
+
+    return np.asarray(pi, dtype=np.float64)
+
+
+def _blend_couplings(
+    pi_anchor: np.ndarray,
+    pi_spatial: np.ndarray,
+    spatial_blend: float,
+) -> np.ndarray:
+    """Blend descriptor and spatial community couplings and renormalize."""
+    A = np.asarray(pi_anchor, dtype=np.float64)
+    B = np.asarray(pi_spatial, dtype=np.float64)
+    if A.shape != B.shape:
+        return B if B.size > 0 else A
+
+    w = float(np.clip(spatial_blend, 0.0, 1.0))
+    out = (1.0 - w) * A + w * B
+    total = float(out.sum())
+    if total <= 0:
+        fallback = B if float(B.sum()) > 0 else A
+        return np.asarray(fallback, dtype=np.float64)
+    return out / (total + 1e-12)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────────────
@@ -133,27 +211,34 @@ def pairwise_align_stfa(
     k_min: int = 10,
     k_max: int = 30,
     gene_weight: float = 0.8,
-    celltype_weight: float = 4.0,
-    neighborhood_weight: float = 4.0,
-    topology_weight: float = 0.8,
-    boundary_weight: float = 1.0,
-    anchor_weight: float = 1.0,
-    compactness_weight: float = 1.25,
-    compactness_quantile: float = 0.90,
-    region_geometry_weight: float = 1.25,
-    shape_context_weight: float = 1.50,
+    celltype_weight: float = 6.0,
+    neighborhood_weight: float = 3.0,
+    topology_weight: float = 0.0,
+    boundary_weight: float = 0.0,
+    anchor_weight: float = 0.25,
+    anchor_spatial_blend: float = 0.75,
+    compactness_weight: float = 2.0,
+    compactness_quantile: float = 0.80,
+    compactness_power: float = 1.75,
+    strict_celltype_gate: float = 3.0,
+    strict_compactness_gate: float = 1.0,
+    strict_compactness_quantile: float = 0.75,
+    region_geometry_weight: float = 2.0,
+    region_geometry_power: float = 1.25,
+    shape_context_weight: float = 2.0,
+    shape_context_power: float = 1.25,
     shape_k_neighbors: int = 24,
-    geodesic_geometry_weight: float = 0.35,
+    geodesic_geometry_weight: float = 0.20,
     geodesic_max_cells: int = 2500,
     rho_min: float = 0.05,
     rho_max: float = 20.0,
     rho_overlap_power: float = 1.5,
-    rho_scale: float = 0.35,
+    rho_scale: float = 0.80,
     overlap_rotation_samples: int = 24,
-    target_mass_fraction: Optional[float] = None,
-    rho_retry_factor: float = 2.0,
-    rho_retry_rounds: int = 2,
-    confidence_power: float = 1.30,
+    target_mass_fraction: Optional[float] = 0.90,
+    rho_retry_factor: float = 1.8,
+    rho_retry_rounds: int = 3,
+    confidence_power: float = 1.20,
     confidence_rounds: int = 1,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, float, float, float, float]:
@@ -170,17 +255,28 @@ def pairwise_align_stfa(
           - ``.obs['cell_type_annot']`` categorical cell-type labels
     radius    : neighbourhood radius for JSD computation (same units as coords)
     use_rep   : if not None, use ``sliceA.obsm[use_rep]`` for gene cost instead of .X
-    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.35.
+    gamma     : GW/feature balance ∈ [0,1]. None → auto-set to 0.30.
     n_iter    : max UFGW conditional-gradient iterations
     eps       : entropic regularisation for mm_unbalanced
     k_min/max : adaptive k-NN graph search range
     gene_weight, celltype_weight, neighborhood_weight, topology_weight,
     boundary_weight, anchor_weight : weights for core biological/topological
         costs in the fused linear objective
+    anchor_spatial_blend : blend ratio of spatial community coupling in
+        geometry-driving pi_comm (0=anchor only, 1=spatial only)
     compactness_weight   : weight of compactness cost in fused linear term
     compactness_quantile : robust scaling quantile for compactness distances
+    compactness_power    : >1 sharpens compactness penalties
+    strict_celltype_gate : additional unnormalised penalty on cell-type
+        mismatched pairs (strongly enforces type-consistent transport)
+    strict_compactness_gate : additional unnormalised penalty on long-range
+        compactness violations
+    strict_compactness_quantile : quantile threshold on M_compact used to
+        define long-range pairs for strict compactness gating
     region_geometry_weight : weight of bidirectional region-geometry cost
+    region_geometry_power  : >1 sharpens region-geometry penalties
     shape_context_weight : weight of local shape-context cost
+    shape_context_power  : >1 sharpens local shape-context penalties
     shape_k_neighbors    : neighborhood size for local shape-context descriptor
     geodesic_geometry_weight : blend weight for graph geodesic in GW geometry
     geodesic_max_cells   : skip geodesic all-pairs above this cell count
@@ -242,8 +338,14 @@ def pairwise_align_stfa(
     comm_A = detect_communities(adj_A)
     comm_B = detect_communities(adj_B)
 
-    M_anchor, pi_comm = compute_M_anchor(
+    M_anchor, pi_comm_anchor = compute_M_anchor(
         comm_A, comm_B, H_A, H_B, cell_types_A, cell_types_B
+    )
+    pi_comm_spatial = _spatial_community_coupling(coords_A, coords_B, comm_A, comm_B)
+    pi_comm_geom = _blend_couplings(
+        pi_comm_anchor,
+        pi_comm_spatial,
+        spatial_blend=anchor_spatial_blend,
     )
 
     if verbose:
@@ -254,30 +356,54 @@ def pairwise_align_stfa(
     # ── 3. Assemble fused cost ────────────────────────────────────────────────
     if verbose:
         print("[STFA] Stage 3: Computing fused cost (gene, celltype, neighborhood, topo, boundary, anchor, compactness, region-geometry, shape-context) ...")
+    zeros = np.zeros((N_A, N_B), dtype=np.float64)
     M_gene         = compute_M_gene(sA, sB, use_rep=use_rep)
-    M_celltype     = compute_M_celltype(sA, sB)
-    M_neighborhood = compute_M_neighborhood(sA, sB, radius=radius)
-    M_topo         = compute_M_topo(H_A, H_B)
-    M_boundary     = compute_M_boundary(adj_A, adj_B)
-    M_shape        = compute_M_shape_context(
-        coords_A,
-        coords_B,
-        k_neighbors=shape_k_neighbors,
+    M_celltype = (
+        compute_M_celltype(sA, sB)
+        if celltype_weight > 0
+        else zeros
+    )
+    M_neighborhood = (
+        compute_M_neighborhood(sA, sB, radius=radius)
+        if neighborhood_weight > 0
+        else zeros
+    )
+    M_topo = (
+        compute_M_topo(H_A, H_B)
+        if topology_weight > 0
+        else zeros
+    )
+    M_boundary = (
+        compute_M_boundary(adj_A, adj_B)
+        if boundary_weight > 0
+        else zeros
+    )
+    M_shape = (
+        compute_M_shape_context(
+            coords_A,
+            coords_B,
+            k_neighbors=shape_k_neighbors,
+            shape_power=shape_context_power,
+        )
+        if shape_context_weight > 0
+        else zeros
     )
     M_compact      = compute_M_compact(
         coords_A,
         coords_B,
         comm_A,
         comm_B,
-        pi_comm,
+        pi_comm_geom,
         quantile=compactness_quantile,
+        distance_power=compactness_power,
     )
     M_region_geom  = compute_M_region_geom(
         coords_A,
         coords_B,
         comm_A,
         comm_B,
-        pi_comm,
+        pi_comm_geom,
+        shape_power=region_geometry_power,
     )
 
     M_fused        = fuse_costs(
@@ -302,6 +428,17 @@ def pairwise_align_stfa(
             float(max(0.0, shape_context_weight)),
         ],
     )
+
+    # Hard gates are intentionally added AFTER normalized fusion.
+    # They provide strict constraints that cannot be diluted by normalization.
+    if strict_celltype_gate > 0 and celltype_weight > 0:
+        M_fused = M_fused + float(strict_celltype_gate) * M_celltype
+
+    if strict_compactness_gate > 0:
+        q_gate = float(np.clip(strict_compactness_quantile, 0.50, 0.99))
+        cut = float(np.quantile(M_compact, q_gate))
+        compact_hard = (M_compact > cut).astype(np.float64)
+        M_fused = M_fused + float(strict_compactness_gate) * compact_hard
 
     # ── 4. Geometry matrices ──────────────────────────────────────────────────
     C_A = _build_geometry_matrix(
@@ -331,7 +468,7 @@ def pairwise_align_stfa(
         rho_scale=rho_scale,
     )
     if gamma is None:
-        gamma = 0.35
+        gamma = 0.30
     p_A = np.ones(N_A) / N_A
     p_B = np.ones(N_B) / N_B
 

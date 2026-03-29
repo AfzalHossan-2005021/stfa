@@ -14,20 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
-from scipy.spatial.distance import cdist
 from typing import Tuple
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Overlap fraction estimation
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _hull_area(pts: np.ndarray) -> float:
-    """Return convex hull area; 0 for degenerate point clouds."""
-    try:
-        return ConvexHull(pts).volume   # .volume is area in 2D
-    except (QhullError, Exception):
-        return 0.0
 
 
 def _canonicalise_coords(coords: np.ndarray) -> np.ndarray:
